@@ -6,9 +6,7 @@ Defines database tables and provides database initialization.
 import sqlite3
 from typing import Optional
 
-
 DATABASE_PATH = 'banking.db'
-
 
 def get_db_connection():
     """

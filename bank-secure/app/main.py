@@ -1,6 +1,10 @@
 """
 Main Application Module
 Entry point for the Secure Banking Application.
+
+HOW to run: 
+    cd C:\Python\Cryptography\Crytography-mid-project\bank-secure
+    python -m app.main
 """
 
 import secrets
