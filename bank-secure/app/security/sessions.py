@@ -4,6 +4,7 @@ Handles secure session creation, validation, and timeout management.
 """
 
 from datetime import datetime, timedelta
+import secrets
 from flask import session
 from functools import wraps
 
@@ -59,6 +60,7 @@ def create_session(user_id: int, username: str):
     # Create new session
     session['user_id'] = user_id
     session['username'] = username
+    session['session_id'] = secrets.token_hex(16)
     session['created_at'] = datetime.now().isoformat()
     session['last_activity'] = datetime.now().isoformat()
     session.permanent = True
@@ -86,6 +88,7 @@ def validate_session() -> tuple[bool, str]:
         idle_time = (datetime.now() - last_activity).total_seconds()
         
         if idle_time > SESSION_TIMEOUT_MINUTES * 60:
+            _revoke_session_key()
             session.clear()
             return False, "Session expired due to inactivity"
     
@@ -95,6 +98,7 @@ def validate_session() -> tuple[bool, str]:
         session_age = (datetime.now() - created_at).total_seconds()
         
         if session_age > SESSION_ABSOLUTE_TIMEOUT_HOURS * 3600:
+            _revoke_session_key()
             session.clear()
             return False, "Session expired (maximum duration reached)"
     
@@ -194,6 +198,7 @@ def destroy_session():
         - Clears all session data
         - Invalidates session cookie
     """
+    _revoke_session_key()
     session.clear()
 
 
@@ -210,3 +215,12 @@ def get_current_user() -> dict:
             'username': session['username']
         }
     return None
+
+
+def _revoke_session_key() -> None:
+    session_id = session.get('session_id')
+    if not session_id:
+        return
+
+    from app.services.secure_session_keys import get_secure_session_key_store
+    get_secure_session_key_store().revoke(session_id)

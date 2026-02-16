@@ -354,20 +354,20 @@ def main():
     Main entry point for running the application.
     """
     print("\n" + "="*70)
-    print("🔒 SECURE BANKING APPLICATION")
+    print("SECURE BANKING APPLICATION")
     print("="*70)
     
     # Initialize database
-    print("\n📝 Initializing database...")
+    print("\nInitializing database...")
     init_database()
     seed_demo_users()
     
     # Check for TLS certificates
-    print("\n🔑 Checking for TLS certificates...")
+    print("\nChecking for TLS certificates...")
     if os.path.exists('cert.pem') and os.path.exists('key.pem'):
-        print("✓ Certificates found!")
+        print("Certificates found.")
     else:
-        print("\n❌ TLS certificates not found!")
+        print("\nTLS certificates not found.")
         print("\nPlease generate certificates using:")
         print("  bash scripts/gen_local_certs.sh")
         print("\nOr manually:")
@@ -382,14 +382,14 @@ def main():
     # Create app
     app = create_app()
     
-    print("\n🚀 Starting HTTPS server...")
+    print("\nStarting HTTPS server...")
     print("   URL: https://localhost:5000")
-    print("\n📋 Demo Credentials:")
-    print("   • alice / Alice123! (Balance: $5000)")
-    print("   • bob / Bob123! (Balance: $3000)")
-    print("\n⚠️  Browser Security Warning Expected:")
+    print("\nDemo Credentials:")
+    print("   - alice / Alice123! (Balance: $5000)")
+    print("   - bob / Bob123! (Balance: $3000)")
+    print("\nBrowser Security Warning Expected:")
     print("   Self-signed certificates trigger warnings in browsers.")
-    print("   Click 'Advanced' → 'Proceed to localhost' to continue.")
+    print("   Click 'Advanced' then 'Proceed to localhost' to continue.")
     print("\n" + "="*70 + "\n")
     
     # Run with TLS

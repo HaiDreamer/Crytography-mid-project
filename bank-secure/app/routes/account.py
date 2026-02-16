@@ -6,7 +6,7 @@ Handles dashboard and account viewing functionality.
 from flask import Blueprint, render_template_string, redirect, url_for
 from app.security.sessions import login_required, get_current_user
 from app.security.csrf import generate_csrf_token
-from app.models.schemas import get_account_by_user_id, get_transaction_history
+from app.models.schemas import get_account_by_user_id, get_secure_transaction_history
 
 
 account_bp = Blueprint('account', __name__)
@@ -29,8 +29,8 @@ def dashboard():
     if not account:
         return "Account not found", 404
     
-    # Get recent transactions
-    transactions = get_transaction_history(account['account_number'], limit=5)
+    # Secure transaction metadata (encrypted payload is stored server-side)
+    transactions = get_secure_transaction_history(user['user_id'], limit=5)
     
     return render_template_string(
         DASHBOARD_TEMPLATE,
@@ -270,31 +270,27 @@ DASHBOARD_TEMPLATE = '''
         </div>
         
         <div class="card transactions">
-            <h2>Recent Transactions</h2>
+            <h2>Recent Secure Transactions</h2>
             
             {% if transactions %}
             <ul class="transaction-list">
                 {% for tx in transactions %}
                 <li class="transaction-item">
                     <div class="transaction-details">
-                        <div class="transaction-type">
-                            {% if tx.from_account == account_number %}
-                                Transfer to {{ tx.to_account }}
-                            {% else %}
-                                Transfer from {{ tx.from_account }}
-                            {% endif %}
+                        <div class="transaction-type">TX #{{ tx.id }} | {{ tx.status.upper() }}</div>
+                        <div class="transaction-time">
+                            {{ tx.created_at }} | risk={{ tx.risk_score }} ({{ tx.risk_decision }})
                         </div>
-                        <div class="transaction-time">{{ tx.timestamp }}</div>
                     </div>
-                    <div class="transaction-amount {% if tx.from_account == account_number %}amount-negative{% else %}amount-positive{% endif %}">
-                        {% if tx.from_account == account_number %}-{% else %}+{% endif %}${{ "%.2f"|format(tx.amount) }}
+                    <div class="transaction-amount amount-positive">
+                        keyId={{ tx.key_id }}
                     </div>
                 </li>
                 {% endfor %}
             </ul>
             {% else %}
             <div class="empty-state">
-                <p>No recent transactions</p>
+                <p>No secure transactions yet</p>
             </div>
             {% endif %}
         </div>

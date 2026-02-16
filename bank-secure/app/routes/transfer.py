@@ -1,170 +1,218 @@
 """
-Transfer Routes
-Handles money transfer functionality with CSRF and replay protection.
+Transfer routes with Hybrid RSA + AES-GCM secure channel.
 """
 
-import secrets
-import sqlite3
-from flask import Blueprint, render_template_string, request, jsonify
-from app.security.sessions import login_required, get_current_user
-from app.security.csrf import generate_csrf_token, csrf_protect, regenerate_csrf_token
-from app.models.schemas import (
-    get_account_by_user_id, get_account_by_number,
-    get_all_accounts_except, get_db_connection
+from __future__ import annotations
+
+from flask import Blueprint, jsonify, render_template_string, request
+
+from app.models.schemas import get_account_by_user_id, get_all_accounts_except
+from app.security.csrf import csrf_protect, generate_csrf_token, regenerate_csrf_token
+from app.security.sessions import login_required
+from app.services.api_gateway import (
+    validate_key_exchange_request,
+    validate_secure_transfer_request,
 )
+from app.services.audit_service import write_audit_event
+from app.services.crypto_service import CryptoServiceError, get_crypto_service
+from app.services.iam_service import get_auth_claims
+from app.services.kms_hsm import get_kms_service
+from app.services.payment_service import process_secure_payment
+from app.services.secure_session_keys import get_secure_session_key_store
 
 
-transfer_bp = Blueprint('transfer', __name__)
+transfer_bp = Blueprint("transfer", __name__)
 
 
-@transfer_bp.route('/transfer', methods=['GET'])
+@transfer_bp.route("/transfer", methods=["GET"])
 @login_required
 def transfer_page():
-    """
-    Display transfer form.
-    
-    Security:
-        - Requires valid session
-        - CSRF token included in form
-        - Shows only other accounts for recipient dropdown
-    """
-    user = get_current_user()
-    account = get_account_by_user_id(user['user_id'])
-    
+    user = get_auth_claims()
+    if not user:
+        return "Unauthorized", 401
+
+    account = get_account_by_user_id(user["user_id"])
     if not account:
         return "Account not found", 404
-    
-    # Get other accounts for recipient selection
-    other_accounts = get_all_accounts_except(user['user_id'])
-    
+
+    other_accounts = get_all_accounts_except(user["user_id"])
+
     return render_template_string(
         TRANSFER_TEMPLATE,
-        account_number=account['account_number'],
-        balance=account['balance'],
+        account_number=account["account_number"],
+        balance=account["balance"],
         other_accounts=other_accounts,
-        csrf_token=generate_csrf_token()
+        csrf_token=generate_csrf_token(),
     )
 
 
-@transfer_bp.route('/transfer', methods=['POST'])
+@transfer_bp.route("/crypto/public-key", methods=["GET"])
+@login_required
+def get_public_key():
+    claims = get_auth_claims()
+    if not claims:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    envelope = get_kms_service().get_public_key()
+
+    write_audit_event(
+        event_type="public_key_requested",
+        status="success",
+        actor_user_id=claims["user_id"],
+        ip_address=request.remote_addr,
+        user_agent=request.user_agent.string,
+        details={"key_id": envelope.key_id},
+    )
+
+    return jsonify(
+        {
+            "key_id": envelope.key_id,
+            "algorithm": envelope.algorithm,
+            "key_size": envelope.key_size,
+            "public_key_pem": envelope.public_key_pem,
+        }
+    )
+
+
+@transfer_bp.route("/crypto/session-key", methods=["POST"])
+@login_required
+@csrf_protect
+def establish_secure_channel():
+    claims = get_auth_claims()
+    if not claims:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    is_valid, error = validate_key_exchange_request(payload)
+    if not is_valid:
+        return jsonify({"error": error}), 400
+
+    try:
+        dek = get_kms_service().unwrap_dek(
+            encrypted_key_b64=payload["encrypted_key"],
+            key_id=payload["key_id"],
+        )
+    except Exception as exc:
+        write_audit_event(
+            event_type="session_key_unwrap",
+            status="failed",
+            actor_user_id=claims["user_id"],
+            ip_address=request.remote_addr,
+            user_agent=request.user_agent.string,
+            details={"reason": str(exc)},
+        )
+        return jsonify({"error": "Unable to unwrap session key"}), 400
+
+    get_secure_session_key_store().put(
+        session_id=claims["session_id"],
+        key_id=payload["key_id"],
+        dek=dek,
+    )
+
+    write_audit_event(
+        event_type="session_key_unwrap",
+        status="success",
+        actor_user_id=claims["user_id"],
+        ip_address=request.remote_addr,
+        user_agent=request.user_agent.string,
+        details={"key_id": payload["key_id"]},
+    )
+
+    return jsonify({"success": True, "message": "Secure channel established"})
+
+
+@transfer_bp.route("/transfer", methods=["POST"])
 @login_required
 @csrf_protect
 def process_transfer():
-    """
-    Process money transfer with comprehensive security checks.
-    
-    Security Protections:
-        1. CSRF token validation (csrf_protect decorator)
-        2. Session validation (login_required decorator)
-        3. Replay attack prevention (unique nonce)
-        4. Server-side validation (balance, account existence)
-        5. Database transaction (atomic operation)
-    
-    Request Body:
-        - to_account: Recipient account number
-        - amount: Transfer amount
-        - csrf_token: CSRF token (validated by decorator)
-        - description: Optional transfer description
-    
-    Returns:
-        JSON response with success/error
-    """
-    user = get_current_user()
-    account = get_account_by_user_id(user['user_id'])
-    
-    if not account:
-        return jsonify({'error': 'Account not found'}), 404
-    
-    # Get transfer details
-    to_account = request.form.get('to_account')
-    description = request.form.get('description', '')
-    
+    claims = get_auth_claims()
+    if not claims:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    is_valid, error = validate_secure_transfer_request(payload)
+    if not is_valid:
+        return jsonify({"error": error}), 400
+
+    dek = get_secure_session_key_store().get(
+        session_id=claims["session_id"],
+        key_id=payload["key_id"],
+    )
+    if not dek:
+        return jsonify({"error": "Secure channel not established"}), 400
+
     try:
-        amount = float(request.form.get('amount', 0))
-    except ValueError:
-        return jsonify({'error': 'Invalid amount'}), 400
-    
-    # Validation
-    if amount <= 0:
-        return jsonify({'error': 'Amount must be positive'}), 400
-    
-    if amount > account['balance']:
-        return jsonify({'error': 'Insufficient funds'}), 400
-    
-    # Check if recipient account exists
-    recipient = get_account_by_number(to_account)
-    if not recipient:
-        return jsonify({'error': 'Recipient account not found'}), 400
-    
-    # Prevent self-transfer
-    if account['account_number'] == to_account:
-        return jsonify({'error': 'Cannot transfer to same account'}), 400
-    
-    # Generate unique nonce for replay protection
-    nonce = secrets.token_hex(16)  # 128 bits
-    
-    # Get CSRF token that was validated
-    csrf_token = request.form.get('csrf_token')
-    
-    # Perform transfer in database transaction
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        # Record transaction with nonce (UNIQUE constraint prevents replay)
-        cursor.execute('''
-            INSERT INTO transactions 
-            (from_account, to_account, amount, description, nonce, csrf_token)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (account['account_number'], to_account, amount, description, nonce, csrf_token))
-        
-        # Update sender balance
-        cursor.execute(
-            "UPDATE accounts SET balance = balance - ? WHERE account_number = ?",
-            (amount, account['account_number'])
+        plaintext_payload = get_crypto_service().decrypt_transfer_payload(
+            dek=dek,
+            nonce_b64=payload["nonce"],
+            aad=payload["aad"],
+            ciphertext_b64=payload["ciphertext"],
+            auth_tag_b64=payload["auth_tag"],
         )
-        
-        # Update recipient balance
-        cursor.execute(
-            "UPDATE accounts SET balance = balance + ? WHERE account_number = ?",
-            (amount, to_account)
+    except CryptoServiceError as exc:
+        write_audit_event(
+            event_type="ciphertext_verify",
+            status="failed",
+            actor_user_id=claims["user_id"],
+            ip_address=request.remote_addr,
+            user_agent=request.user_agent.string,
+            details={"reason": str(exc)},
         )
-        
-        conn.commit()
-        
-        # Get new balance
-        cursor.execute(
-            "SELECT balance FROM accounts WHERE account_number = ?",
-            (account['account_number'],)
-        )
-        new_balance = cursor.fetchone()['balance']
-        
-        # Regenerate CSRF token after successful operation
-        regenerate_csrf_token()
-        
-        return jsonify({
-            'success': True,
-            'message': f'Successfully transferred ${amount:.2f} to {to_account}',
-            'new_balance': new_balance
-        })
-        
-    except sqlite3.IntegrityError as e:
-        # Nonce already exists - replay attack detected!
-        conn.rollback()
-        return jsonify({
-            'error': 'Duplicate transaction detected (replay attack prevented)'
-        }), 400
-        
-    except Exception as e:
-        conn.rollback()
-        return jsonify({'error': f'Transfer failed: {str(e)}'}), 500
-        
-    finally:
-        conn.close()
+        return jsonify({"error": str(exc)}), 400
+
+    result = process_secure_payment(
+        actor_user_id=claims["user_id"],
+        aad=payload["aad"],
+        key_id=payload["key_id"],
+        nonce=payload["nonce"],
+        ciphertext=payload["ciphertext"],
+        auth_tag=payload["auth_tag"],
+        decrypted_payload=plaintext_payload,
+    )
+
+    write_audit_event(
+        event_type="secure_transfer",
+        status="success" if result.success else "failed",
+        actor_user_id=claims["user_id"],
+        ip_address=request.remote_addr,
+        user_agent=request.user_agent.string,
+        details={
+            "tx_id": result.tx_id,
+            "risk_score": result.risk_score,
+            "risk_decision": result.risk_decision,
+            "risk_reason": result.risk_reason,
+        },
+    )
+
+    if not result.success:
+        return jsonify(
+            {
+                "error": result.message,
+                "risk_score": result.risk_score,
+                "risk_decision": result.risk_decision,
+            }
+        ), result.status_code
+
+    next_csrf_token = regenerate_csrf_token()
+
+    return jsonify(
+        {
+            "success": True,
+            "message": result.message,
+            "new_balance": result.new_balance,
+            "tx_id": result.tx_id,
+            "risk_score": result.risk_score,
+            "risk_decision": result.risk_decision,
+            "risk_reason": result.risk_reason,
+            "csrf_token": next_csrf_token,
+        }
+    )
 
 
-# HTML Template for transfer page
-TRANSFER_TEMPLATE = '''
+TRANSFER_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
@@ -179,7 +227,7 @@ TRANSFER_TEMPLATE = '''
             padding: 20px;
         }
         .container {
-            max-width: 600px;
+            max-width: 700px;
             margin: 0 auto;
         }
         .header {
@@ -187,7 +235,7 @@ TRANSFER_TEMPLATE = '''
             color: white;
             padding: 30px;
             border-radius: 12px;
-            margin-bottom: 30px;
+            margin-bottom: 20px;
             box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         }
         .header h1 {
@@ -201,32 +249,16 @@ TRANSFER_TEMPLATE = '''
             margin-bottom: 20px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
-        .card h2 {
-            color: #333;
-            margin-bottom: 20px;
-            font-size: 24px;
-        }
         .account-info {
             background: #f5f7fa;
             padding: 15px;
             border-radius: 8px;
-            margin-bottom: 25px;
-        }
-        .account-info p {
-            margin: 5px 0;
-            color: #666;
-        }
-        .account-info strong {
-            color: #333;
-        }
-        .balance {
-            font-size: 24px;
-            color: #2e7d32;
-            font-weight: bold;
-        }
-        .form-group {
             margin-bottom: 20px;
         }
+        .account-info p { margin: 5px 0; color: #666; }
+        .account-info strong { color: #333; }
+        .balance { font-size: 24px; color: #2e7d32; font-weight: bold; }
+        .form-group { margin-bottom: 20px; }
         label {
             display: block;
             margin-bottom: 8px;
@@ -240,7 +272,6 @@ TRANSFER_TEMPLATE = '''
             border: 2px solid #e0e0e0;
             border-radius: 6px;
             font-size: 15px;
-            transition: border-color 0.3s;
         }
         select:focus, input:focus {
             outline: none;
@@ -256,20 +287,21 @@ TRANSFER_TEMPLATE = '''
             font-size: 16px;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s;
-        }
-        button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(76, 175, 80, 0.4);
         }
         button:disabled {
-            background: #ccc;
+            opacity: 0.6;
             cursor: not-allowed;
-            transform: none;
         }
         .btn-back {
             background: linear-gradient(135deg, #757575 0%, #616161 100%);
             margin-top: 10px;
+            text-decoration: none;
+            display: block;
+            text-align: center;
+            color: white;
+            padding: 14px;
+            border-radius: 6px;
+            font-weight: 600;
         }
         .message {
             padding: 15px;
@@ -289,12 +321,17 @@ TRANSFER_TEMPLATE = '''
             color: #721c24;
             display: block;
         }
+        .message.info {
+            background: #e3f2fd;
+            border-left: 4px solid #1e88e5;
+            color: #0d47a1;
+            display: block;
+        }
         .security-notice {
             background: #fff3cd;
             border-left: 4px solid #ffc107;
             padding: 15px;
             border-radius: 4px;
-            margin-top: 20px;
             font-size: 13px;
         }
         .security-notice strong {
@@ -306,9 +343,7 @@ TRANSFER_TEMPLATE = '''
             list-style: none;
             padding-left: 0;
         }
-        .security-notice li {
-            padding: 3px 0;
-        }
+        .security-notice li { padding: 3px 0; }
         .security-notice li:before {
             content: "✓ ";
             color: #28a745;
@@ -319,20 +354,18 @@ TRANSFER_TEMPLATE = '''
 <body>
     <div class="container">
         <div class="header">
-            <h1>💸 Transfer Money</h1>
-            <p>Send money securely</p>
+            <h1>💸 Secure Transfer (Hybrid RSA + AES-GCM)</h1>
+            <p>Encrypted payload + tag verification + replay protection</p>
         </div>
-        
+
         <div class="card">
             <div class="account-info">
                 <p><strong>Your Account:</strong> {{ account_number }}</p>
                 <p><strong>Available Balance:</strong> <span class="balance">${{ "%.2f"|format(balance) }}</span></p>
             </div>
-            
-            <h2>Transfer Details</h2>
-            
+
             <div id="message" class="message"></div>
-            
+
             <form id="transferForm">
                 <div class="form-group">
                     <label for="to_account">To Account</label>
@@ -343,97 +376,220 @@ TRANSFER_TEMPLATE = '''
                         {% endfor %}
                     </select>
                 </div>
-                
+
                 <div class="form-group">
                     <label for="amount">Amount ($)</label>
                     <input type="number" id="amount" name="amount" step="0.01" min="0.01" max="{{ balance }}" required>
                 </div>
-                
+
                 <div class="form-group">
                     <label for="description">Description (optional)</label>
                     <input type="text" id="description" name="description" placeholder="e.g., Rent payment">
                 </div>
-                
-                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                
-                <button type="submit" id="submitBtn">Transfer Money</button>
-                <a href="{{ url_for('account.dashboard') }}"><button type="button" class="btn-back">Back to Dashboard</button></a>
+
+                <input type="hidden" id="csrf_token" name="csrf_token" value="{{ csrf_token }}">
+
+                <button type="submit" id="submitBtn">Transfer Money Securely</button>
+                <a href="{{ url_for('account.dashboard') }}" class="btn-back">Back to Dashboard</a>
             </form>
         </div>
-        
+
         <div class="card">
             <div class="security-notice">
-                <strong>🔒 Security Protections Active</strong>
+                <strong>🔒 Security Components Active</strong>
                 <ul>
-                    <li>CSRF Token Validation</li>
-                    <li>Replay Attack Prevention (Unique Nonce)</li>
-                    <li>Server-side Balance Verification</li>
-                    <li>TLS 1.3 Encryption</li>
-                    <li>Session Timeout Protection</li>
+                    <li>API Gateway input validation</li>
+                    <li>IAM claims from authenticated session</li>
+                    <li>KMS/HSM RSA key unwrapping</li>
+                    <li>Crypto Service AES-256-GCM + tag verification</li>
+                    <li>Risk Engine scoring and decisioning</li>
+                    <li>Audit logging and encrypted transaction storage</li>
                 </ul>
             </div>
         </div>
     </div>
-    
+
     <script>
         const form = document.getElementById('transferForm');
         const submitBtn = document.getElementById('submitBtn');
         const messageDiv = document.getElementById('message');
-        
-        form.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            
-            // Disable button to prevent double-submit
+        const csrfInput = document.getElementById('csrf_token');
+
+        let aesKey = null;
+        let keyId = null;
+        let channelReady = false;
+
+        function setMessage(text, type) {
+            messageDiv.className = `message ${type}`;
+            messageDiv.textContent = text;
+        }
+
+        function bytesToBase64(bytes) {
+            let binary = '';
+            const chunk = 0x8000;
+            for (let i = 0; i < bytes.length; i += chunk) {
+                binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+            }
+            return btoa(binary);
+        }
+
+        function pemToArrayBuffer(pem) {
+            const b64 = pem
+                .replace('-----BEGIN PUBLIC KEY-----', '')
+                .replace('-----END PUBLIC KEY-----', '')
+                .replace(/\\s+/g, '');
+            const binary = atob(b64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+            }
+            return bytes.buffer;
+        }
+
+        async function bootstrapSecureChannel() {
+            if (channelReady) {
+                return;
+            }
+
+            setMessage('Establishing secure channel...', 'info');
+
+            const keyResponse = await fetch('{{ url_for("transfer.get_public_key") }}');
+            const keyData = await keyResponse.json();
+            if (!keyResponse.ok) {
+                throw new Error(keyData.error || 'Failed to get public key');
+            }
+
+            keyId = keyData.key_id;
+
+            const rsaPublicKey = await crypto.subtle.importKey(
+                'spki',
+                pemToArrayBuffer(keyData.public_key_pem),
+                { name: 'RSA-OAEP', hash: 'SHA-256' },
+                false,
+                ['encrypt']
+            );
+
+            aesKey = await crypto.subtle.generateKey(
+                { name: 'AES-GCM', length: 256 },
+                true,
+                ['encrypt']
+            );
+
+            const rawAesKey = await crypto.subtle.exportKey('raw', aesKey);
+            const encryptedAesKey = await crypto.subtle.encrypt(
+                { name: 'RSA-OAEP' },
+                rsaPublicKey,
+                rawAesKey
+            );
+
+            const handshakeResponse = await fetch('{{ url_for("transfer.establish_secure_channel") }}', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    encrypted_key: bytesToBase64(new Uint8Array(encryptedAesKey)),
+                    key_id: keyId,
+                    csrf_token: csrfInput.value
+                })
+            });
+            const handshakeData = await handshakeResponse.json();
+
+            if (!handshakeResponse.ok) {
+                throw new Error(handshakeData.error || 'Failed to establish secure channel');
+            }
+
+            channelReady = true;
+            setMessage('Secure channel ready (RSA + AES-GCM)', 'success');
+        }
+
+        async function encryptTransferPayload(payload) {
+            const aadObject = {
+                txid: crypto.randomUUID(),
+                actor: 'customer',
+                channel: 'web',
+                ts: new Date().toISOString()
+            };
+            const aad = JSON.stringify(aadObject);
+
+            const iv = crypto.getRandomValues(new Uint8Array(12));
+            const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+            const aadBytes = new TextEncoder().encode(aad);
+
+            const encrypted = new Uint8Array(await crypto.subtle.encrypt(
+                {
+                    name: 'AES-GCM',
+                    iv,
+                    additionalData: aadBytes,
+                    tagLength: 128
+                },
+                aesKey,
+                plaintext
+            ));
+
+            const tag = encrypted.slice(encrypted.length - 16);
+            const ciphertext = encrypted.slice(0, encrypted.length - 16);
+
+            return {
+                key_id: keyId,
+                nonce: bytesToBase64(iv),
+                aad,
+                ciphertext: bytesToBase64(ciphertext),
+                auth_tag: bytesToBase64(tag)
+            };
+        }
+
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
             submitBtn.disabled = true;
             submitBtn.textContent = 'Processing...';
-            
-            const formData = new FormData(form);
-            
+
             try {
+                await bootstrapSecureChannel();
+
+                const amount = parseFloat(document.getElementById('amount').value);
+                const transferPayload = {
+                    to_account: document.getElementById('to_account').value,
+                    amount,
+                    description: document.getElementById('description').value
+                };
+
+                const encryptedPayload = await encryptTransferPayload(transferPayload);
+                encryptedPayload.csrf_token = csrfInput.value;
+
                 const response = await fetch('{{ url_for("transfer.process_transfer") }}', {
                     method: 'POST',
-                    body: formData
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(encryptedPayload)
                 });
-                
                 const data = await response.json();
-                
-                if (data.success) {
-                    messageDiv.className = 'message success';
-                    messageDiv.innerHTML = '✓ ' + data.message + '<br>New balance: $' + data.new_balance.toFixed(2);
-                    
-                    // Reset form
-                    form.reset();
-                    
-                    // Redirect to dashboard after 2 seconds
-                    setTimeout(() => {
-                        window.location.href = '{{ url_for("account.dashboard") }}';
-                    }, 2000);
-                } else {
-                    messageDiv.className = 'message error';
-                    messageDiv.innerHTML = '✗ ' + data.error;
-                    submitBtn.disabled = false;
-                    submitBtn.textContent = 'Transfer Money';
+
+                if (!response.ok) {
+                    throw new Error(data.error || 'Transfer failed');
                 }
+
+                setMessage(
+                    `${data.message} | tx=${data.tx_id} | risk=${data.risk_score} (${data.risk_decision})`,
+                    'success'
+                );
+
+                if (data.csrf_token) {
+                    csrfInput.value = data.csrf_token;
+                }
+                form.reset();
+
+                setTimeout(() => {
+                    window.location.href = '{{ url_for("account.dashboard") }}';
+                }, 1800);
+
             } catch (error) {
-                messageDiv.className = 'message error';
-                messageDiv.innerHTML = '✗ Network error occurred';
+                setMessage(error.message, 'error');
+            } finally {
                 submitBtn.disabled = false;
-                submitBtn.textContent = 'Transfer Money';
+                submitBtn.textContent = 'Transfer Money Securely';
             }
         });
-        
-        // Validate amount doesn't exceed balance
-        document.getElementById('amount').addEventListener('input', (e) => {
-            const amount = parseFloat(e.target.value);
-            const balance = {{ balance }};
-            
-            if (amount > balance) {
-                e.target.setCustomValidity('Amount exceeds available balance');
-            } else {
-                e.target.setCustomValidity('');
-            }
-        });
+
+        bootstrapSecureChannel().catch((error) => setMessage(error.message, 'error'));
     </script>
 </body>
 </html>
-'''
+"""
