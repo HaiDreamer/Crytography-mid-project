@@ -18,7 +18,7 @@ def get_db_connection():
     Note:
         In production, use connection pooling (e.g., SQLAlchemy)
     """
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(DATABASE_PATH, timeout=10)
     conn.row_factory = sqlite3.Row  # Access columns by name
     return conn
 
@@ -30,7 +30,10 @@ def init_database():
     Tables:
         - users: User accounts with hashed passwords
         - accounts: Bank accounts linked to users
-        - transactions: Transaction history with nonce for replay protection
+        - transactions: Legacy plaintext demo transaction history
+        - secure_transactions: Encrypted payload store (diagram-aligned)
+        - session_audit: Session lifecycle log
+        - audit_events: Security/audit event log
     
     Security Features:
         - Password stored as hash (bcrypt), never plaintext
@@ -83,7 +86,26 @@ def init_database():
         )
     ''')
     
-    # Session audit log (optional - for enhanced security)
+    # Secure transactions table (encrypted payload only)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS secure_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_user_id INTEGER NOT NULL,
+            key_id TEXT NOT NULL,
+            nonce TEXT UNIQUE NOT NULL,
+            aad TEXT NOT NULL,
+            ciphertext TEXT NOT NULL,
+            auth_tag TEXT NOT NULL,
+            status TEXT NOT NULL,
+            risk_score INTEGER DEFAULT 0,
+            risk_decision TEXT DEFAULT 'allow',
+            risk_reason TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (actor_user_id) REFERENCES users(id)
+        )
+    ''')
+
+    # Session audit log
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS session_audit (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,17 +117,38 @@ def init_database():
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     ''')
+
+    # Security audit events
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            actor_user_id INTEGER,
+            ip_address TEXT,
+            user_agent TEXT,
+            details TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (actor_user_id) REFERENCES users(id)
+        )
+    ''')
     
     # Create indexes for performance
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_accounts_user_id ON accounts(user_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_transactions_from ON transactions(from_account)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_transactions_to ON transactions(to_account)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_transactions_nonce ON transactions(nonce)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_secure_tx_actor ON secure_transactions(actor_user_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_secure_tx_created_at ON secure_transactions(created_at)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_audit_events_type ON audit_events(event_type)')
+
+    # Keep tests deterministic across repeated runs.
+    cursor.execute("DELETE FROM transactions WHERE nonce = 'test_nonce_123'")
     
     conn.commit()
     conn.close()
     
-    print("✓ Database initialized successfully")
+    print("Database initialized successfully")
 
 
 def seed_demo_users():
@@ -149,12 +192,12 @@ def seed_demo_users():
         )
         
         conn.commit()
-        print("✓ Demo users created:")
+        print("Demo users created:")
         print("  - alice / Alice123! (Balance: $5000)")
         print("  - bob / Bob123! (Balance: $3000)")
         
     except sqlite3.IntegrityError:
-        print("✓ Demo users already exist")
+        print("Demo users already exist")
     finally:
         conn.close()
 
@@ -358,3 +401,59 @@ def get_transaction_history(account_number: str, limit: int = 10) -> list[dict]:
         })
     
     return transactions
+
+
+def count_recent_secure_transactions(actor_user_id: int, window_minutes: int = 5) -> int:
+    """
+    Count recent secure transactions for velocity/risk checks.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA foreign_keys = ON")
+    cursor.execute("PRAGMA journal_mode = WAL")
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS tx_count
+        FROM secure_transactions
+        WHERE actor_user_id = ?
+          AND created_at >= datetime('now', ?)
+        """,
+        (actor_user_id, f"-{int(window_minutes)} minutes"),
+    )
+    count = int(cursor.fetchone()["tx_count"])
+    conn.close()
+    return count
+
+
+def get_secure_transaction_history(actor_user_id: int, limit: int = 10) -> list[dict]:
+    """
+    Return secure transaction metadata without plaintext financial payload.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, key_id, nonce, status, risk_score, risk_decision, risk_reason, created_at
+        FROM secure_transactions
+        WHERE actor_user_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (actor_user_id, limit),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [
+        {
+            "id": row["id"],
+            "key_id": row["key_id"],
+            "nonce": row["nonce"],
+            "status": row["status"],
+            "risk_score": row["risk_score"],
+            "risk_decision": row["risk_decision"],
+            "risk_reason": row["risk_reason"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]

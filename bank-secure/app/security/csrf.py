@@ -64,10 +64,14 @@ def csrf_protect(f):
     """
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        from flask import request, jsonify
+        from flask import request, jsonify, current_app
+
+        if current_app.config.get('WTF_CSRF_ENABLED') is False:
+            return f(*args, **kwargs)
         
         if request.method in ['POST', 'PUT', 'DELETE']:
-            token = request.form.get('csrf_token') or request.json.get('csrf_token')
+            json_payload = request.get_json(silent=True) or {}
+            token = request.form.get('csrf_token') or json_payload.get('csrf_token')
             
             if not validate_csrf_token(token):
                 return jsonify({'error': 'Invalid CSRF token'}), 403
