@@ -10,15 +10,12 @@ This project implements the diagram components as service modules inside one Fla
   - Holds RSA key pair, returns public key, unwraps AES session key.
 - **Crypto Service (AES-256-GCM)**: `app/services/crypto_service.py`
   - Decrypts ciphertext, verifies GCM tag, parses JSON plaintext.
-- **Risk Engine**: `app/services/risk_engine.py`
-  - Produces risk score + decision (allow/review/deny).
 - **Payment Service**: `app/services/payment_service.py`
   - Validates transfer business rules, updates balances atomically, stores encrypted record.
 - **Audit / Logging**: `app/services/audit_service.py`
   - Writes audit events for key exchange, integrity failures, and transfer outcomes.
 
 ## 2. Secure Data Store
-
 Encrypted transaction payload is stored in:
 
 - Table: `secure_transactions`

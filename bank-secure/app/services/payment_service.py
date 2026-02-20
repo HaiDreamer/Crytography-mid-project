@@ -13,7 +13,6 @@ from app.models.schemas import (
     get_account_by_user_id,
     get_db_connection,
 )
-from app.services.risk_engine import RiskDecision, evaluate_transfer_risk
 
 
 @dataclass
@@ -62,17 +61,6 @@ def process_secure_payment(
         return PaymentResult(False, 400, "Recipient account not found")
 
     recent_count = count_recent_secure_transactions(actor_user_id, 5)
-    risk: RiskDecision = evaluate_transfer_risk(amount, recent_count, aad)
-
-    if risk.decision == "deny":
-        return PaymentResult(
-            False,
-            403,
-            "Transaction blocked by risk engine",
-            risk_score=risk.score,
-            risk_decision=risk.decision,
-            risk_reason=risk.reason,
-        )
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -92,9 +80,6 @@ def process_secure_payment(
                 ciphertext,
                 auth_tag,
                 "completed",
-                risk.score,
-                risk.decision,
-                risk.reason,
             ),
         )
         tx_id = cursor.lastrowid
@@ -121,9 +106,6 @@ def process_secure_payment(
             f"Successfully transferred ${amount:.2f} to {to_account}",
             new_balance=new_balance,
             tx_id=tx_id,
-            risk_score=risk.score,
-            risk_decision=risk.decision,
-            risk_reason=risk.reason,
         )
 
     except sqlite3.IntegrityError:
