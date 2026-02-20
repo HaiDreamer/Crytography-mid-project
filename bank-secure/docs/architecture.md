@@ -4,9 +4,7 @@
 
 This project implements the diagram components as service modules inside one Flask app process:
 
-- **API Gateway / WAF**: `app/services/api_gateway.py`
-  - Validates payload structure, field sizes, and base64 format.
-- **IAM Service (AuthN + AuthZ)**: `app/services/iam_service.py` + `app/security/sessions.py`
+- **AuthN + AuthZ** `app/security/sessions.py`
   - Authenticated session claims (`user_id`, `username`, `session_id`).
 - **KMS / HSM**: `app/services/kms_hsm.py`
   - Holds RSA key pair, returns public key, unwraps AES session key.

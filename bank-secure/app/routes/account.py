@@ -1,6 +1,7 @@
 """
 Account Routes
-Handles dashboard and account viewing functionality.
+Handles dashboard and account viewing functionality
+    assumes the user has an active login session
 """
 
 from flask import Blueprint, render_template_string, redirect, url_for
@@ -8,7 +9,7 @@ from app.security.sessions import login_required, get_current_user
 from app.security.csrf import generate_csrf_token
 from app.models.schemas import get_account_by_user_id, get_secure_transaction_history
 
-
+# blueprint setup
 account_bp = Blueprint('account', __name__)
 
 
@@ -229,7 +230,7 @@ DASHBOARD_TEMPLATE = '''
 <body>
     <div class="container">
         <div class="header">
-            <h1>🏦 Welcome, {{ username }}!</h1>
+            <h1> Welcome, {{ username }}!</h1>
             <p>Secure Banking Dashboard</p>
         </div>
         
@@ -258,10 +259,10 @@ DASHBOARD_TEMPLATE = '''
             
             <div class="actions">
                 <a href="{{ url_for('transfer.transfer_page') }}" class="btn btn-primary">
-                    💸 Transfer Money
+                     Transfer Money
                 </a>
                 <a href="{{ url_for('index') }}" class="btn btn-secondary">
-                    🔒 Security Info
+                     Security Info
                 </a>
                 <a href="{{ url_for('auth.logout') }}" class="btn btn-danger">
                     Logout
@@ -297,7 +298,7 @@ DASHBOARD_TEMPLATE = '''
         
         <div class="card">
             <div class="security-info">
-                <strong>🔒 Your Session is Protected</strong><br>
+                <strong> Your Session is Protected</strong><br>
                 • CSRF Token: <code>{{ csrf_token[:16] }}...</code><br>
                 • Session cookies: Secure ✓ | HttpOnly ✓ | SameSite=Lax ✓<br>
                 • Idle timeout: 30 minutes<br>

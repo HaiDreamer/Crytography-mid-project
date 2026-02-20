@@ -4,13 +4,13 @@
 # Generates self-signed TLS certificates for local development
 
 echo "=================================="
-echo "🔑 Generating TLS Certificates"
+echo "Generating TLS Certificates"
 echo "=================================="
 echo ""
 
 # Check if openssl is installed
 if ! command -v openssl &> /dev/null; then
-    echo "❌ Error: openssl is not installed"
+    echo "Error: openssl is not installed"
     echo ""
     echo "Install openssl:"
     echo "  • macOS: brew install openssl"
@@ -22,7 +22,7 @@ fi
 
 # Check if certificates already exist
 if [ -f "cert.pem" ] && [ -f "key.pem" ]; then
-    echo "⚠️  Certificates already exist!"
+    echo "Certificates already exist!"
     read -p "Overwrite existing certificates? (y/N): " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
@@ -51,7 +51,7 @@ if [ -f "cert.pem" ] && [ -f "key.pem" ]; then
     echo "Certificate details:"
     openssl x509 -in cert.pem -noout -subject -dates
     echo ""
-    echo "⚠️  Security Note:"
+    echo "Security Note:"
     echo "  These are SELF-SIGNED certificates for development only."
     echo "  Browsers will show security warnings (expected behavior)."
     echo "  For production, use CA-signed certificates (Let's Encrypt, etc.)"
@@ -63,6 +63,6 @@ if [ -f "cert.pem" ] && [ -f "key.pem" ]; then
     echo ""
 else
     echo ""
-    echo "❌ Certificate generation failed!"
+    echo "Certificate generation failed!"
     exit 1
 fi

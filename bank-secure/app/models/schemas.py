@@ -1,4 +1,5 @@
 """
+With API sqlite3
 Database Schema Module
 Defines database tables and provides database initialization.
 """
@@ -19,7 +20,7 @@ def get_db_connection():
         In production, use connection pooling (e.g., SQLAlchemy)
     """
     conn = sqlite3.connect(DATABASE_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row  # Access columns by name
+    conn.row_factory = sqlite3.Row          # Access columns by name
     return conn
 
 

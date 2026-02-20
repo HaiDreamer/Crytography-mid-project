@@ -15,7 +15,8 @@ from app.models.schemas import get_user_by_username, update_last_login, log_sess
 
 auth_bp = Blueprint('auth', __name__)
 
-
+# GET: take user input (handle error) 
+# POST: rate limiting, read username and password, handle error case, account lock check, password verification
 @auth_bp.route('/login', methods=['GET', 'POST'])
 def login():
     """
@@ -281,12 +282,12 @@ LOGIN_TEMPLATE = '''
 </head>
 <body>
     <div class="container">
-        <div class="lock-icon">🔒</div>
+        <div class="lock-icon"></div>
         <h1>Secure Bank</h1>
         <p class="subtitle">Login to your account</p>
         
         <div class="security-badge">
-            <strong>🔐 Security Features Active</strong>
+            <strong>Security Features Active</strong>
             <ul>
                 <li>TLS 1.3 Encryption</li>
                 <li>Bcrypt Password Hashing</li>
@@ -296,7 +297,7 @@ LOGIN_TEMPLATE = '''
         </div>
         
         {% if error %}
-        <div class="error">⚠️ {{ error }}</div>
+        <div class="error">{{ error }}</div>
         {% endif %}
         
         <form method="POST">
@@ -316,7 +317,7 @@ LOGIN_TEMPLATE = '''
         </form>
         
         <div class="demo-accounts">
-            <strong>📋 Demo Accounts</strong>
+            <strong>Demo Accounts</strong>
             Username: <code>alice</code> | Password: <code>Alice123!</code><br>
             Username: <code>bob</code> | Password: <code>Bob123!</code>
         </div>

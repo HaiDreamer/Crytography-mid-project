@@ -10,10 +10,10 @@ from functools import wraps
 
 
 # Session configuration constants
-SESSION_TIMEOUT_MINUTES = 30  # Idle timeout
+SESSION_TIMEOUT_MINUTES = 30        # Idle timeout
 SESSION_ABSOLUTE_TIMEOUT_HOURS = 8  # Absolute timeout
 MAX_LOGIN_ATTEMPTS = 5
-LOCKOUT_DURATION_SECONDS = 300  # 5 minutes
+LOCKOUT_DURATION_SECONDS = 300      # 5 minutes
 
 
 # In-memory rate limiting (in production, use Redis)
