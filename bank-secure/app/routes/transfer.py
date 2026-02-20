@@ -1,14 +1,13 @@
 """
 Transfer routes with Hybrid RSA + AES-GCM secure channel.
-Simplified version without API Gateway and IAM Service dependencies.
 """
 from __future__ import annotations
 
-from flask import Blueprint, jsonify, render_template_string, request, session
+from functools import wraps
+from flask import Blueprint, jsonify, render_template_string, request, session, redirect, url_for
 
 from app.models.schemas import get_account_by_user_id, get_all_accounts_except
 from app.security.csrf import csrf_protect, generate_csrf_token, regenerate_csrf_token
-from app.security.sessions import login_required
 from app.services.audit_service import write_audit_event
 from app.services.crypto_service import CryptoServiceError, get_crypto_service
 from app.services.kms_hsm import get_kms_service
@@ -18,9 +17,27 @@ from app.services.secure_session_keys import get_secure_session_key_store
 transfer_bp = Blueprint("transfer", __name__)
 
 
+def login_required(f):
+    """
+    Decorator to require authentication for routes.
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Check if user is logged in (user_id exists in session)
+        if "user_id" not in session:
+            # For API endpoints, return JSON error
+            if request.is_json or request.path.startswith('/crypto/'):
+                return jsonify({"error": "Unauthorized - Please log in"}), 401
+            # For page endpoints, redirect to login
+            return redirect(url_for('auth.login', next=request.url))
+        return f(*args, **kwargs)
+    return decorated_function
+
+
 def get_auth_claims():
     """
     Extracts user information from Flask session.
+    Replacement for IAM service get_auth_claims()
     """
     if "user_id" not in session:
         return None
@@ -93,10 +110,6 @@ def validate_secure_transfer_request(payload):
     
     return True, None
 
-
-# ============================================================================
-# ROUTES
-# ============================================================================
 
 @transfer_bp.route("/transfer", methods=["GET"])
 @login_required

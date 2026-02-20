@@ -1,17 +1,60 @@
 """
 Account Routes
-Handles dashboard and account viewing functionality
-    assumes the user has an active login session
+Handles dashboard and account viewing functionality.
+Simplified version without session management imports.
 """
 
-from flask import Blueprint, render_template_string, redirect, url_for
-from app.security.sessions import login_required, get_current_user
+from functools import wraps
+from flask import Blueprint, render_template_string, redirect, url_for, session, jsonify, request
+
 from app.security.csrf import generate_csrf_token
 from app.models.schemas import get_account_by_user_id, get_secure_transaction_history
 
-# blueprint setup
+
+# Blueprint setup
 account_bp = Blueprint('account', __name__)
 
+
+# ============================================================================
+# AUTHENTICATION HELPERS
+# ============================================================================
+
+def login_required(f):
+    """
+    Decorator to require authentication for routes.
+    Checks if user_id exists in session.
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            # For API endpoints, return JSON error
+            if request.is_json:
+                return jsonify({"error": "Unauthorized - Please log in"}), 401
+            # For page endpoints, redirect to login
+            return redirect(url_for('auth.login', next=request.url))
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def get_current_user():
+    """
+    Get current authenticated user from Flask session.
+    
+    Returns: dict with user info or None
+    """
+    if 'user_id' not in session:
+        return None
+    
+    return {
+        'user_id': session.get('user_id'),
+        'username': session.get('username'),
+        'id': session.get('user_id'),  # Alias for compatibility
+    }
+
+
+# ============================================================================
+# ROUTES
+# ============================================================================
 
 @account_bp.route('/dashboard')
 @login_required
@@ -25,29 +68,40 @@ def dashboard():
         - CSRF token included for future forms
     """
     user = get_current_user()
+    
+    if not user:
+        return redirect(url_for('auth.login'))
+    
     account = get_account_by_user_id(user['user_id'])
     
     if not account:
         return "Account not found", 404
     
     # Secure transaction metadata (encrypted payload is stored server-side)
-    transactions = get_secure_transaction_history(user['user_id'], limit=5)
+    try:
+        transactions = get_secure_transaction_history(user['user_id'], limit=5)
+    except Exception as e:
+        print(f"Failed to load transactions: {e}")
+        transactions = []
     
     return render_template_string(
         DASHBOARD_TEMPLATE,
         username=user['username'],
         account_number=account['account_number'],
         balance=account['balance'],
-        account_type=account['account_type'],
+        account_type=account.get('account_type', 'checking'),
         transactions=transactions,
         csrf_token=generate_csrf_token()
     )
 
 
-# HTML Template for dashboard
+# ============================================================================
+# HTML TEMPLATE
+# ============================================================================
+
 DASHBOARD_TEMPLATE = '''
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <title>Dashboard - Secure Bank</title>
     <meta charset="utf-8">
@@ -225,17 +279,20 @@ DASHBOARD_TEMPLATE = '''
             padding: 40px;
             color: #999;
         }
+        .empty-state p {
+            font-size: 16px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1> Welcome, {{ username }}!</h1>
-            <p>Secure Banking Dashboard</p>
+            <h1>👋 Welcome, {{ username }}!</h1>
+            <p>🔒 Secure Banking Dashboard</p>
         </div>
         
         <div class="card">
-            <h2>Account Overview</h2>
+            <h2>💰 Account Overview</h2>
             
             <div class="balance-display">
                 <div class="balance-label">Current Balance</div>
@@ -253,56 +310,62 @@ DASHBOARD_TEMPLATE = '''
                 </div>
                 <div class="info-item">
                     <div class="info-label">Status</div>
-                    <div class="info-value">✓ Active</div>
+                    <div class="info-value">✅ Active</div>
                 </div>
             </div>
             
             <div class="actions">
                 <a href="{{ url_for('transfer.transfer_page') }}" class="btn btn-primary">
-                     Transfer Money
+                    💸 Transfer Money
                 </a>
-                <a href="{{ url_for('index') }}" class="btn btn-secondary">
-                     Security Info
+                <a href="/" class="btn btn-secondary">
+                    🔐 Security Info
                 </a>
                 <a href="{{ url_for('auth.logout') }}" class="btn btn-danger">
-                    Logout
+                    🚪 Logout
                 </a>
             </div>
         </div>
         
         <div class="card transactions">
-            <h2>Recent Secure Transactions</h2>
+            <h2>📋 Recent Secure Transactions</h2>
             
             {% if transactions %}
             <ul class="transaction-list">
                 {% for tx in transactions %}
                 <li class="transaction-item">
                     <div class="transaction-details">
-                        <div class="transaction-type">TX #{{ tx.id }} | {{ tx.status.upper() }}</div>
+                        <div class="transaction-type">
+                            🔒 TX #{{ tx.id }} | {{ tx.status.upper() }}
+                        </div>
                         <div class="transaction-time">
-                            {{ tx.created_at }} | risk={{ tx.risk_score }} ({{ tx.risk_decision }})
+                            🕒 {{ tx.created_at }} | Risk: {{ tx.risk_score }} ({{ tx.risk_decision }})
                         </div>
                     </div>
                     <div class="transaction-amount amount-positive">
-                        keyId={{ tx.key_id }}
+                        🔑 Key: {{ tx.key_id[:12] }}...
                     </div>
                 </li>
                 {% endfor %}
             </ul>
             {% else %}
             <div class="empty-state">
-                <p>No secure transactions yet</p>
+                <p>📭 No secure transactions yet</p>
+                <p style="font-size: 14px; color: #bbb; margin-top: 10px;">
+                    Make your first secure transfer to see transactions here
+                </p>
             </div>
             {% endif %}
         </div>
         
         <div class="card">
             <div class="security-info">
-                <strong> Your Session is Protected</strong><br>
+                <strong>🛡️ Your Session is Protected</strong><br>
                 • CSRF Token: <code>{{ csrf_token[:16] }}...</code><br>
-                • Session cookies: Secure ✓ | HttpOnly ✓ | SameSite=Lax ✓<br>
+                • Session cookies: Secure ✅ | HttpOnly ✅ | SameSite=Lax ✅<br>
                 • Idle timeout: 30 minutes<br>
-                • TLS 1.3 encryption active
+                • TLS 1.3 encryption active 🔒<br>
+                • Session-based authentication ✅
             </div>
         </div>
     </div>

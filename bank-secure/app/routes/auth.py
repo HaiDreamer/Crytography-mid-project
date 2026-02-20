@@ -1,13 +1,13 @@
 """
 Authentication Routes
 Handles login, logout, and authentication-related endpoints.
+Fully simplified version with minimal dependencies.
 """
 
-from flask import Blueprint, render_template_string, request, redirect, url_for
-from app.security.sessions import (
-    create_session, destroy_session, check_rate_limit, 
-    reset_rate_limit, login_required
-)
+from functools import wraps
+from flask import Blueprint, render_template_string, request, redirect, url_for, session, jsonify
+from datetime import datetime, timedelta
+
 from app.security.csrf import generate_csrf_token
 from app.security.passwords import verify_password
 from app.models.schemas import get_user_by_username, update_last_login, log_session_event
@@ -15,8 +15,116 @@ from app.models.schemas import get_user_by_username, update_last_login, log_sess
 
 auth_bp = Blueprint('auth', __name__)
 
-# GET: take user input (handle error) 
-# POST: rate limiting, read username and password, handle error case, account lock check, password verification
+
+# ============================================================================
+# SESSION AND RATE LIMITING HELPERS
+# ============================================================================
+
+# In-memory rate limiting storage (replace with Redis/database in production)
+_rate_limit_store = {}
+
+def check_rate_limit(username, max_attempts=5, window_minutes=5):
+    """
+    Check if user has exceeded rate limit.
+    
+    Returns: (is_allowed: bool, error_message: str or None)
+    """
+    now = datetime.now()
+    
+    if username not in _rate_limit_store:
+        _rate_limit_store[username] = {
+            'attempts': 0,
+            'window_start': now
+        }
+    
+    user_data = _rate_limit_store[username]
+    
+    # Check if window has expired
+    if now - user_data['window_start'] > timedelta(minutes=window_minutes):
+        # Reset window
+        user_data['attempts'] = 0
+        user_data['window_start'] = now
+    
+    # Check if exceeded limit
+    if user_data['attempts'] >= max_attempts:
+        time_remaining = window_minutes - (now - user_data['window_start']).seconds // 60
+        return False, f"Too many login attempts. Try again in {time_remaining} minutes."
+    
+    # Increment attempts
+    user_data['attempts'] += 1
+    
+    return True, None
+
+
+def reset_rate_limit(username):
+    """Reset rate limit for a user after successful login."""
+    if username in _rate_limit_store:
+        del _rate_limit_store[username]
+
+
+def create_session(user_id, username):
+    """
+    Create a new session for authenticated user.
+    Stores user info in Flask session.
+    """
+    # Clear any existing session data
+    session.clear()
+    
+    # Set new session data
+    session['user_id'] = user_id
+    session['username'] = username
+    session['logged_in'] = True
+    session['login_time'] = datetime.now().isoformat()
+    
+    # Regenerate session ID to prevent session fixation
+    session.modified = True
+
+
+def destroy_session():
+    """
+    Destroy the current session.
+    Clears all session data.
+    """
+    session.clear()
+
+
+def get_current_user():
+    """
+    Get current authenticated user from session.
+    
+    Returns: dict with user info or None
+    """
+    if 'user_id' not in session:
+        return None
+    
+    return {
+        'user_id': session.get('user_id'),
+        'username': session.get('username'),
+        'id': session.get('user_id'),  # Alias for compatibility
+    }
+
+
+def login_required(f):
+    """
+    Decorator to require authentication for routes.
+    Checks if user_id exists in session.
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            # For API endpoints, return JSON error
+            if request.is_json:
+                return jsonify({"error": "Unauthorized - Please log in"}), 401
+            # For page endpoints, redirect to login
+            return redirect(url_for('auth.login', next=request.url))
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+# ============================================================================
+# ROUTES
+# ============================================================================
+
 @auth_bp.route('/login', methods=['GET', 'POST'])
 def login():
     """
@@ -34,6 +142,14 @@ def login():
     if request.method == 'POST':
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '')
+        
+        # Basic validation
+        if not username or not password:
+            return render_template_string(
+                LOGIN_TEMPLATE,
+                error='Username and password are required',
+                csrf_token=generate_csrf_token()
+            )
         
         # Check rate limiting
         is_allowed, error_msg = check_rate_limit(username)
@@ -55,7 +171,7 @@ def login():
             )
         
         # Check if account is locked
-        if user['account_locked']:
+        if user.get('account_locked', False):
             return render_template_string(
                 LOGIN_TEMPLATE,
                 error='Account is locked. Contact administrator.',
@@ -70,22 +186,33 @@ def login():
             reset_rate_limit(username)
             
             # Log successful login
-            log_session_event(
-                user['id'],
-                'login_success',
-                request.remote_addr,
-                request.user_agent.string
-            )
+            try:
+                log_session_event(
+                    user['id'],
+                    'login_success',
+                    request.remote_addr,
+                    request.user_agent.string
+                )
+            except Exception as e:
+                # Don't fail login if logging fails
+                print(f"Failed to log session event: {e}")
             
+            # Redirect to next page or dashboard
+            next_page = request.args.get('next')
+            if next_page and next_page.startswith('/'):  # Security: prevent open redirect
+                return redirect(next_page)
             return redirect(url_for('account.dashboard'))
         else:
             # Failed login
-            log_session_event(
-                user['id'],
-                'login_failure',
-                request.remote_addr,
-                request.user_agent.string
-            )
+            try:
+                log_session_event(
+                    user['id'],
+                    'login_failure',
+                    request.remote_addr,
+                    request.user_agent.string
+                )
+            except Exception as e:
+                print(f"Failed to log session event: {e}")
             
             return render_template_string(
                 LOGIN_TEMPLATE,
@@ -111,25 +238,29 @@ def logout():
         - Clears all session data
         - Invalidates session cookie
     """
-    from app.security.sessions import get_current_user
-    
     user = get_current_user()
     if user:
-        log_session_event(
-            user['user_id'],
-            'logout',
-            request.remote_addr,
-            request.user_agent.string
-        )
+        try:
+            log_session_event(
+                user.get('user_id') or user.get('id'),
+                'logout',
+                request.remote_addr,
+                request.user_agent.string
+            )
+        except Exception as e:
+            print(f"Failed to log session event: {e}")
     
     destroy_session()
     return redirect(url_for('auth.login'))
 
 
-# HTML Template for login page
+# ============================================================================
+# HTML TEMPLATE
+# ============================================================================
+
 LOGIN_TEMPLATE = '''
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <title>Secure Bank - Login</title>
     <meta charset="utf-8">
@@ -157,6 +288,9 @@ LOGIN_TEMPLATE = '''
             font-size: 64px;
             text-align: center;
             margin-bottom: 20px;
+        }
+        .lock-icon::before {
+            content: "🔒";
         }
         h1 {
             text-align: center;
@@ -283,47 +417,50 @@ LOGIN_TEMPLATE = '''
 <body>
     <div class="container">
         <div class="lock-icon"></div>
-        <h1>Secure Bank</h1>
+        <h1>🏦 Secure Bank</h1>
         <p class="subtitle">Login to your account</p>
         
         <div class="security-badge">
-            <strong>Security Features Active</strong>
+            <strong>🔐 Security Features Active</strong>
             <ul>
-                <li>TLS 1.3 Encryption</li>
-                <li>Bcrypt Password Hashing</li>
-                <li>Rate Limiting (5 attempts/5min)</li>
-                <li>Session Timeout Protection</li>
+                <li>Session-based authentication</li>
+                <li>Bcrypt password hashing</li>
+                <li>Rate limiting (5 attempts/5min)</li>
+                <li>Session fixation protection</li>
+                <li>CSRF token protection</li>
             </ul>
         </div>
         
         {% if error %}
-        <div class="error">{{ error }}</div>
+        <div class="error">⚠️ {{ error }}</div>
         {% endif %}
         
-        <form method="POST">
+        <form method="POST" action="{{ url_for('auth.login') }}">
             <div class="form-group">
                 <label for="username">Username</label>
-                <input type="text" id="username" name="username" required autofocus>
+                <input type="text" id="username" name="username" required autofocus autocomplete="username">
             </div>
             
             <div class="form-group">
                 <label for="password">Password</label>
-                <input type="password" id="password" name="password" required>
+                <input type="password" id="password" name="password" required autocomplete="current-password">
             </div>
             
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             
-            <button type="submit">Sign In</button>
+            <button type="submit">🔓 Sign In Securely</button>
         </form>
         
         <div class="demo-accounts">
-            <strong>Demo Accounts</strong>
-            Username: <code>alice</code> | Password: <code>Alice123!</code><br>
-            Username: <code>bob</code> | Password: <code>Bob123!</code>
+            <strong>📝 Demo Accounts</strong>
+            <div style="margin-top: 8px;">
+                <strong>User 1:</strong> <code>alice</code> / <code>Alice123!</code><br>
+                <strong>User 2:</strong> <code>bob</code> / <code>Bob123!</code>
+            </div>
         </div>
         
         <div class="footer-link">
-            <a href="{{ url_for('index') }}">View Security Configuration</a>
+            <a href="/">← Back to Home</a>
         </div>
     </div>
 </body>

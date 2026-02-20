@@ -11,7 +11,6 @@ import secrets
 import os
 from flask import Flask, render_template_string
 
-from app.security.sessions import configure_session
 from app.models.schemas import init_database, seed_demo_users
 from app.routes.auth import auth_bp
 from app.routes.account import account_bp
@@ -31,9 +30,6 @@ def create_app():
     
     # Security configuration
     app.secret_key = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
-    
-    # Configure secure session settings
-    configure_session(app)
     
     # Register blueprints
     app.register_blueprint(auth_bp)
