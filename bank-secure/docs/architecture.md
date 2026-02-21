@@ -4,8 +4,6 @@
 
 This project implements the diagram components as service modules inside one Flask app process:
 
-- **AuthN + AuthZ** `app/security/sessions.py`
-  - Authenticated session claims (`user_id`, `username`, `session_id`).
 - **KMS / HSM**: `app/services/kms_hsm.py`
   - Holds RSA key pair, returns public key, unwraps AES session key.
 - **Crypto Service (AES-256-GCM)**: `app/services/crypto_service.py`
